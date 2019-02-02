@@ -12,6 +12,9 @@ The toolkit is released under a **Creative Commons Attribution 4.0 International
 
 [See a short introductory video on the PyTorch-Kaldi Toolkit](https://www.youtube.com/watch?v=VDQaf0SS4K0&t=2s)
 
+We are actively thinking about the next version of the PyTorch-Kaldi toolkit. Our goal is to make the development of speech recognition systems more easy and flexible. Please, [fill this survey to help us!](https://docs.google.com/forms/d/12jd-QP5m8NAJVpiypvtVGy1n_d2iuWaLozXq5hsg4yA/edit?usp=sharing)
+
+
 ## Table of Contents
 * [Introduction](#introduction)
 * [Prerequisites](#prerequisites)
@@ -140,7 +143,7 @@ This script starts a full ASR experiment and performs training, validation, forw
 - The folder *exp_files* contains several files that summarize the evolution of training and validation over the various epochs. For instance, files *.info report chunk-specific information such as the chunk_loss and error and the training time. The *.cfg files are the chunk-specific configuration files (see general architecture for more details), while files *.lst report the list of features used to train each specific chunk.
 - At the end of training, a directory called *generated outputs* containing plots of loss and errors during the various training epochs is created.
 
-**Note that you can stop the experiment at any time.** If you run again the script it will automatically start from the last chunk correctly processed. The training could take a couple of hours, depending on the available GPU.
+**Note that you can stop the experiment at any time.** If you run again the script it will automatically start from the last chunk correctly processed. The training could take a couple of hours, depending on the available GPU. Note also that if you would like to change some parameters of the configuration file (e.g., n_chunks=,fea_lst=,batch_size_train=,..) you must specify a different output folder (output_folder=).
 
 **Debug:** If you run into some errors, we suggest to do the following checks:
 1.	Take a look into the standard output.

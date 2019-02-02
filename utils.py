@@ -19,6 +19,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import matplotlib as mpl
+mpl.use('Agg')
 import matplotlib.pyplot as plt
 
 
@@ -235,7 +236,7 @@ def check_field(inp,type_inp,field):
         try: 
             list(map(int,lst))
         except ValueError:
-            sys.stderr.write("ERROR: The field \"%s\" can only contain a list of integer (got \"%s\") \n" % (field,inp))
+            sys.stderr.write("ERROR: The field \"%s\" can only contain a list of integer (got \"%s\").  Make also sure there aren't white spaces between commas.\n" % (field,inp))
             valid_field=False
             sys.exit(0)
 
@@ -261,7 +262,7 @@ def check_field(inp,type_inp,field):
         try: 
             list(map(float,lst))
         except ValueError:
-            sys.stderr.write("ERROR: The field \"%s\" can only contain a list of floats (got \"%s\") \n" % (field,inp))
+            sys.stderr.write("ERROR: The field \"%s\" can only contain a list of floats (got \"%s\"). Make also sure there aren't white spaces between commas. \n" % (field,inp))
             valid_field=False
             sys.exit(0)
         # Check if the value if within the expected range
@@ -287,7 +288,7 @@ def check_field(inp,type_inp,field):
         inps=inp.split(',')
         for elem in inps:
             if not(elem in lst):
-                sys.stderr.write("ERROR: The field \"%s\" can only contain a list of boolean (got \"%s\") \n" % (field,inp))
+                sys.stderr.write("ERROR: The field \"%s\" can only contain a list of boolean (got \"%s\"). Make also sure there aren't white spaces between commas.\n" % (field,inp))
                 valid_field=False
                 sys.exit(0)
                     
@@ -496,14 +497,21 @@ def check_cfg(cfg_file,config,cfg_file_proto):
         
         fea_names_lst.append(sorted(fea_names))
         lab_names_lst.append(sorted(lab_names))
-
+        
+        # Check that fea_name doesn't contain special characters
+        for name_features in fea_names_lst[cnt]:
+            if not(re.match("^[a-zA-Z0-9]*$", name_features)):
+                    sys.stderr.write("ERROR: features names (fea_name=) must contain only letters or numbers (no special characters as \"_,$,..\") \n" )
+                    sec_parse=False
+                    sys.exit(0) 
+            
         if cnt>0:
             if fea_names_lst[cnt-1]!=fea_names_lst[cnt]:
-                sys.stderr.write("features name (fea_name) must be the same of all the datasets! \n" )
+                sys.stderr.write("ERROR: features name (fea_name) must be the same of all the datasets! \n" )
                 sec_parse=False
                 sys.exit(0) 
             if lab_names_lst[cnt-1]!=lab_names_lst[cnt]:
-                sys.stderr.write("labels name (lab_name) must be the same of all the datasets! \n" )
+                sys.stderr.write("ERROR: labels name (lab_name) must be the same of all the datasets! \n" )
                 sec_parse=False
                 sys.exit(0) 
             
@@ -554,6 +562,10 @@ def check_cfg(cfg_file,config,cfg_file_proto):
                     folder_lab_count=lab_folders[lab_lst.index(forward_norm_lst[i])]
                     cmd="hmm-info "+folder_lab_count+"/final.mdl | awk '/pdfs/{print $4}'"
                     output=run_shell(cmd,log_file)
+                    if output.decode().rstrip()=='':
+                        sys.stderr.write("ERROR: hmm-info command doesn't exist. Make sure your .bashrc contains the Kaldi paths and correctly exports it.\n")
+                        sys.exit(0)
+
                     N_out=int(output.decode().rstrip())
                     N_out_lab[lab_lst.index(forward_norm_lst[i])]=N_out
                     count_file_path=out_folder+'/exp_files/forward_'+forward_out_lst[i]+'_'+forward_norm_lst[i]+'.count'
@@ -673,60 +685,7 @@ def create_chunks(config):
                     f.writelines(tr_chunks_fea_wr)
                     f.close()
     
-    #Training chunk lists creation
-#    tr_data_name=config['data_use']['train_with'].split(',')
-#    [fea_names,fea_lsts,fea_opts,cws_left,cws_right]=parse_fea_field(config[cfg_item2sec(config,'data_name',tr_data_name[0])]['fea'])
-#     
-#    full_list_fea=[]
-#    for i in range(len(fea_names)):
-#        full_list=[]
-#        N_chunks_tr=0
-#        
-#        # Reading training feature lists
-#        for dataset in tr_data_name:
-#            sec_data=cfg_item2sec(config,'data_name',dataset)
-#            [fea_lst,list_fea,fea_opts,cws_left,cws_right]=parse_fea_field(config[cfg_item2sec(config,'data_name',dataset)]['fea'])
-#            N_chunks_tr= N_chunks_tr+int(config[sec_data]['N_chunks'])
-#            full_list.append([line.rstrip('\n')+',' for line in open(list_fea[i])])
-#        
-#        full_list=sum(full_list, [])
-#        full_list=sorted(full_list)
-#        full_list_fea.append(full_list)
-#        
-#    
-#    # concatenating all the featues in a single file (useful for shuffling consistently)
-#    full_list_fea_conc=full_list_fea[0]
-#    for i in range(1,len(full_list_fea)):  
-#        full_list_fea_conc=list(map(str.__add__,full_list_fea_conc,full_list_fea[i]))   
-#    
-#        
-#    for ep in range(N_ep):
-#        
-#        # randomize the list
-#        random.shuffle(full_list_fea_conc)
-#
-#        tr_chunks_fea=list(split_chunks(full_list_fea_conc,N_chunks_tr)) 
-#        tr_chunks_fea.reverse()
-#        # Note: without reverse the shortest chunk is the last one. 
-#        # With reverse I process the shortest chunk first (it is more safe)
-#        
-#        # Writing the lst files for each chunk/epoch
-#        for ck in range(N_chunks_tr):
-#            #print(tr_chunks_fea[ck])
-#            for i in range(len(fea_names)):
-#                
-#                tr_chunks_fea_split=[];
-#                for snt in tr_chunks_fea[ck]:
-#                    #print(snt.split(',')[i])
-#                    tr_chunks_fea_split.append(snt.split(',')[i])
-#                    
-#                output_lst_file=out_folder+'/exp_files/train_'+config['data_use']['train_with'].replace(',','+')+'_ep'+format(ep, "03d")+'_ck'+format(ck, "02d")+'_'+fea_names[i]+'.lst'
-#                f=open(output_lst_file,'w')
-#                tr_chunks_fea_wr=map(lambda x:x+'\n', tr_chunks_fea_split)
-#                f.writelines(tr_chunks_fea_wr)
-#                f.close()             
-                    
-                
+            
     # Validation chunk lists creation    
     valid_data_name=config['data_use']['valid_with'].split(',')
     
@@ -1489,6 +1448,9 @@ def model_init(inp_out_dict,model,config,arch_dict,use_cuda,multi_gpu,to_do):
             config.set(arch_dict[inp1][0],'use_cuda',config['exp']['use_cuda'])
             config.set(arch_dict[inp1][0],'to_do',config['exp']['to_do'])
             
+            arch_freeze_flag=strtobool(config[arch_dict[inp1][0]]['arch_freeze'])
+
+            
             # initialize the neural network
             net=nn_class(config[arch_dict[inp1][0]],inp_dim)
     
@@ -1501,7 +1463,11 @@ def model_init(inp_out_dict,model,config,arch_dict,use_cuda,multi_gpu,to_do):
                     
             
             if to_do=='train':
-                net.train()
+                if not(arch_freeze_flag):
+                    net.train()
+                else:
+                   # Switch to eval modality if architecture is frozen (mainly for batch_norm/dropout functions)
+                   net.eval() 
             else:
                 net.eval()
     
