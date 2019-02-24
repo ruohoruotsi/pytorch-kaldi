@@ -14,12 +14,14 @@ import sys
 import glob
 import configparser
 import numpy as np
-from utils import check_cfg,create_chunks,write_cfg_chunk,compute_avg_performance, \
+from utils import check_cfg,create_lists,create_configs, compute_avg_performance, \
                   read_args_command_line, run_shell,compute_n_chunks, get_all_archs,cfg_item2sec, \
-                  dump_epoch_results, run_shell_display, create_curves
+                  dump_epoch_results, create_curves,change_lr_cfg,expand_str_ep
 from shutil import copyfile
 import re
 from distutils.util import strtobool
+import importlib
+import math
 
 # Reading global cfg file (first argument-mandatory file) 
 cfg_file=sys.argv[1]
@@ -31,6 +33,10 @@ else:
     config.read(cfg_file)
 
 
+# Reading and parsing optional arguments from command line (e.g.,--optimization,lr=0.002)
+[section_args,field_args,value_args]=read_args_command_line(sys.argv,config)
+
+
 # Output folder creation
 out_folder=config['exp']['out_folder']
 if not os.path.exists(out_folder):
@@ -40,12 +46,26 @@ if not os.path.exists(out_folder):
 log_file=config['exp']['out_folder']+'/log.log'
 
 
-# Reading and parsing optional arguments from command line (e.g.,--optimization,lr=0.002)
-[section_args,field_args,value_args]=read_args_command_line(sys.argv,config)
     
 # Read, parse, and check the config file     
 cfg_file_proto=config['cfg_proto']['cfg_proto']
 [config,name_data,name_arch]=check_cfg(cfg_file,config,cfg_file_proto)
+
+
+# Read cfg file options
+is_production=strtobool(config['exp']['production'])
+cfg_file_proto_chunk=config['cfg_proto']['cfg_proto_chunk']
+
+cmd=config['exp']['cmd']
+N_ep=int(config['exp']['N_epochs_tr'])
+N_ep_str_format='0'+str(max(math.ceil(np.log10(N_ep)),1))+'d'
+tr_data_lst=config['data_use']['train_with'].split(',')
+valid_data_lst=config['data_use']['valid_with'].split(',')
+forward_data_lst=config['data_use']['forward_with'].split(',')
+max_seq_length_train=config['batches']['max_seq_length_train']
+forward_save_files=list(map(strtobool,config['forward']['save_out_file'].split(',')))
+
+
 print("- Reading config file......OK!")
 
      
@@ -55,8 +75,19 @@ with open(cfg_file, 'w') as configfile:
     config.write(configfile) 
     
 
+# Load the run_nn function from core libriary    
+# The run_nn is a function that process a single chunk of data
+run_nn_script=config['exp']['run_nn_script'].split('.py')[0]
+module = importlib.import_module('core')
+run_nn=getattr(module, run_nn_script)
+
+         
+         
 # Splitting data into chunks (see out_folder/additional_files)
-create_chunks(config)
+create_lists(config)
+
+# Writing the config files
+create_configs(config)  
 
 print("- Chunk creation......OK!\n")
 
@@ -66,36 +97,25 @@ res_file = open(res_file_path, "w")
 res_file.close()
 
 
-# Read cfg file options
-is_production=strtobool(config['exp']['production'])
-cfg_file_proto_chunk=config['cfg_proto']['cfg_proto_chunk']
-run_nn_script=config['exp']['run_nn_script']
-cmd=config['exp']['cmd']
-N_ep=int(config['exp']['N_epochs_tr'])
-tr_data_lst=config['data_use']['train_with'].split(',')
-valid_data_lst=config['data_use']['valid_with'].split(',')
-forward_data_lst=config['data_use']['forward_with'].split(',')
-max_seq_length_train=int(config['batches']['max_seq_length_train'])
-forward_save_files=list(map(strtobool,config['forward']['save_out_file'].split(',')))
-
 
 # Learning rates and architecture-specific optimization parameters
 arch_lst=get_all_archs(config)
 lr={}
+auto_lr_annealing={}
 improvement_threshold={}
 halving_factor={}
 pt_files={}
 
 for arch in arch_lst:
-    lr[arch]=float(config[arch]['arch_lr'])
+    lr[arch]=expand_str_ep(config[arch]['arch_lr'],'float',N_ep,'|','*')
+    if len(config[arch]['arch_lr'].split('|'))>1:
+       auto_lr_annealing[arch]=False
+    else:
+       auto_lr_annealing[arch]=True 
     improvement_threshold[arch]=float(config[arch]['arch_improvement_threshold'])
     halving_factor[arch]=float(config[arch]['arch_halving_factor'])
     pt_files[arch]=config[arch]['arch_pretrain_file']
 
-if strtobool(config['batches']['increase_seq_length_train']):
-    max_seq_length_train_curr=int(config['batches']['start_seq_len_train'])
-else:
-    max_seq_length_train_curr=max_seq_length_train
     
 # If production, skip training and forward directly from last saved models
 if is_production:
@@ -106,6 +126,25 @@ if is_production:
     for arch in pt_files.keys():
         model_files[arch] = out_folder+'/exp_files/final_'+arch+'.pkl'
 
+
+op_counter=1 # used to dected the next configuration file from the list_chunks.txt
+
+# Reading the ordered list of config file to process 
+cfg_file_list = [line.rstrip('\n') for line in open(out_folder+'/exp_files/list_chunks.txt')]
+cfg_file_list.append(cfg_file_list[-1])
+
+
+# A variable that tells if the current chunk is the first one that is being processed:
+processed_first=True
+
+data_name=[]
+data_set=[]
+data_end_index=[]
+fea_dict=[]
+lab_dict=[]
+arch_dict=[]
+
+ 
 # --------TRAINING LOOP--------#
 for ep in range(N_ep):
     
@@ -113,22 +152,20 @@ for ep in range(N_ep):
     tr_error_tot=0
     tr_time_tot=0
     
-    print('------------------------------ Epoch %s / %s ------------------------------'%(format(ep, "03d"),format(N_ep-1, "03d")))
+    print('------------------------------ Epoch %s / %s ------------------------------'%(format(ep, N_ep_str_format),format(N_ep-1, N_ep_str_format)))
 
     for tr_data in tr_data_lst:
         
         # Compute the total number of chunks for each training epoch
-        N_ck_tr=compute_n_chunks(out_folder,tr_data,ep,'train')
-    
+        N_ck_tr=compute_n_chunks(out_folder,tr_data,ep,N_ep_str_format,'train')
+        N_ck_str_format='0'+str(max(math.ceil(np.log10(N_ck_tr)),1))+'d'
      
         # ***Epoch training***
         for ck in range(N_ck_tr):
             
-            # path of the list of features for this chunk
-            lst_file=out_folder+'/exp_files/train_'+tr_data+'_ep'+format(ep, "03d")+'_ck'+format(ck, "02d")+'_*.lst'
             
             # paths of the output files (info,model,chunk_specific cfg file)
-            info_file=out_folder+'/exp_files/train_'+tr_data+'_ep'+format(ep, "03d")+'_ck'+format(ck, "02d")+'.info'
+            info_file=out_folder+'/exp_files/train_'+tr_data+'_ep'+format(ep, N_ep_str_format)+'_ck'+format(ck, N_ck_str_format)+'.info'
             
             if ep+ck==0:
                 model_files_past={}
@@ -139,29 +176,39 @@ for ep in range(N_ep):
             for arch in pt_files.keys():
                 model_files[arch]=info_file.replace('.info','_'+arch+'.pkl')
             
-            config_chunk_file=out_folder+'/exp_files/train_'+tr_data+'_ep'+format(ep, "03d")+'_ck'+format(ck, "02d")+'.cfg'
+            config_chunk_file=out_folder+'/exp_files/train_'+tr_data+'_ep'+format(ep, N_ep_str_format)+'_ck'+format(ck, N_ck_str_format)+'.cfg'
+            
+            # update learning rate in the cfg file (if needed)
+            change_lr_cfg(config_chunk_file,lr,ep)
                         
-            # Write chunk-specific cfg file
-            write_cfg_chunk(cfg_file,config_chunk_file,cfg_file_proto_chunk,pt_files,lst_file,info_file,'train',tr_data,lr,max_seq_length_train_curr,name_data,ep,ck)
-
             
             # if this chunk has not already been processed, do training...
             if not(os.path.exists(info_file)):
                 
                     print('Training %s chunk = %i / %i' %(tr_data,ck+1, N_ck_tr))
-    
-                    # Doing training
-                    cmd_chunk=cmd+'python ' + run_nn_script + ' ' + config_chunk_file + ' 2> ' + log_file
-                    run_shell_display(cmd_chunk)
+                                 
+                    # getting the next chunk 
+                    next_config_file=cfg_file_list[op_counter]
+
+                        
+                    # run chunk processing                    
+                    [data_name,data_set,data_end_index,fea_dict,lab_dict,arch_dict]=run_nn(data_name,data_set,data_end_index,fea_dict,lab_dict,arch_dict,config_chunk_file,processed_first,next_config_file)
+                                        
                     
+                    # update the first_processed variable
+                    processed_first=False
+                                                            
                     if not(os.path.exists(info_file)):
                         sys.stderr.write("ERROR: training epoch %i, chunk %i not done! File %s does not exist.\nSee %s \n" % (ep,ck,info_file,log_file))
                         sys.exit(0)
                                   
-                      
+            # update the operation counter
+            op_counter+=1          
+            
+            
             # update pt_file (used to initialized the DNN for the next chunk)  
             for pt_arch in pt_files.keys():
-                pt_files[pt_arch]=out_folder+'/exp_files/train_'+tr_data+'_ep'+format(ep, "03d")+'_ck'+format(ck, "02d")+'_'+pt_arch+'.pkl'
+                pt_files[pt_arch]=out_folder+'/exp_files/train_'+tr_data+'_ep'+format(ep, N_ep_str_format)+'_ck'+format(ck, N_ck_str_format)+'_'+pt_arch+'.pkl'
                 
             # remove previous pkl files
             if len(model_files_past.keys())>0:
@@ -171,7 +218,7 @@ for ep in range(N_ep):
     
     
         # Training Loss and Error    
-        tr_info_lst=sorted(glob.glob(out_folder+'/exp_files/train_'+tr_data+'_ep'+format(ep, "03d")+'*.info'))
+        tr_info_lst=sorted(glob.glob(out_folder+'/exp_files/train_'+tr_data+'_ep'+format(ep, N_ep_str_format)+'*.info'))
         [tr_loss,tr_error,tr_time]=compute_avg_performance(tr_info_lst)
         
         tr_loss_tot=tr_loss_tot+tr_loss
@@ -191,35 +238,40 @@ for ep in range(N_ep):
     for valid_data in valid_data_lst:
         
         # Compute the number of chunks for each validation dataset
-        N_ck_valid=compute_n_chunks(out_folder,valid_data,ep,'valid')
-
+        N_ck_valid=compute_n_chunks(out_folder,valid_data,ep,N_ep_str_format,'valid')
+        N_ck_str_format='0'+str(max(math.ceil(np.log10(N_ck_valid)),1))+'d'
     
         for ck in range(N_ck_valid):
             
-            # path of the list of features for this chunk
-            lst_file=out_folder+'/exp_files/valid_'+valid_data+'_ep'+format(ep, "03d")+'_ck'+format(ck, "02d")+'_*.lst'
             
             # paths of the output files
-            info_file=out_folder+'/exp_files/valid_'+valid_data+'_ep'+format(ep, "03d")+'_ck'+format(ck, "02d")+'.info'            
-            config_chunk_file=out_folder+'/exp_files/valid_'+valid_data+'_ep'+format(ep, "03d")+'_ck'+format(ck, "02d")+'.cfg'
-            
-            # Write chunk-specific cfg file
-            write_cfg_chunk(cfg_file,config_chunk_file,cfg_file_proto_chunk,model_files,lst_file,info_file,'valid',valid_data,lr,max_seq_length_train_curr,name_data,ep,ck)
-
+            info_file=out_folder+'/exp_files/valid_'+valid_data+'_ep'+format(ep, N_ep_str_format)+'_ck'+format(ck, N_ck_str_format)+'.info'            
+            config_chunk_file=out_folder+'/exp_files/valid_'+valid_data+'_ep'+format(ep, N_ep_str_format)+'_ck'+format(ck, N_ck_str_format)+'.cfg'
+    
             # Do validation if the chunk was not already processed
             if not(os.path.exists(info_file)):
                 print('Validating %s chunk = %i / %i' %(valid_data,ck+1,N_ck_valid))
                     
                 # Doing eval
-                cmd_chunk=cmd+'python ' + run_nn_script + ' ' + config_chunk_file + ' 2> ' + log_file
-                run_shell_display(cmd_chunk)
+                
+                # getting the next chunk 
+                next_config_file=cfg_file_list[op_counter]
+                                         
+                # run chunk processing                    
+                [data_name,data_set,data_end_index,fea_dict,lab_dict,arch_dict]=run_nn(data_name,data_set,data_end_index,fea_dict,lab_dict,arch_dict,config_chunk_file,processed_first,next_config_file)
+                                                   
+                # update the first_processed variable
+                processed_first=False
                 
                 if not(os.path.exists(info_file)):
                     sys.stderr.write("ERROR: validation on epoch %i, chunk %i of dataset %s not done! File %s does not exist.\nSee %s \n" % (ep,ck,valid_data,info_file,log_file))
                     sys.exit(0)
+    
+            # update the operation counter
+            op_counter+=1
         
         # Compute validation performance  
-        valid_info_lst=sorted(glob.glob(out_folder+'/exp_files/valid_'+valid_data+'_ep'+format(ep, "03d")+'*.info'))
+        valid_info_lst=sorted(glob.glob(out_folder+'/exp_files/valid_'+valid_data+'_ep'+format(ep, N_ep_str_format)+'*.info'))
         [valid_loss,valid_error,valid_time]=compute_avg_performance(valid_info_lst)
         valid_peformance_dict[valid_data]=[valid_loss,valid_error,valid_time]
         tot_time=tot_time+valid_time
@@ -228,13 +280,6 @@ for ep in range(N_ep):
     # Print results in both res_file and stdout
     dump_epoch_results(res_file_path, ep, tr_data_lst, tr_loss_tot, tr_error_tot, tot_time, valid_data_lst, valid_peformance_dict, lr, N_ep)
 
-    #  if needed, update sentence_length
-    if strtobool(config['batches']['increase_seq_length_train']):
-        max_seq_length_train_curr=max_seq_length_train_curr*int(config['batches']['multply_factor_seq_len_train'])
-        if max_seq_length_train_curr>max_seq_length_train:
-            max_seq_length_train_curr=max_seq_length_train
-            
-               
         
     # Check for learning rate annealing
     if ep>0:
@@ -243,8 +288,10 @@ for ep in range(N_ep):
         err_valid_mean_prev=np.mean(np.asarray(list(valid_peformance_dict_prev.values()))[:,1])
         
         for lr_arch in lr.keys():
-            if ((err_valid_mean_prev-err_valid_mean)/err_valid_mean)<improvement_threshold[lr_arch]:
-                lr[lr_arch]=lr[lr_arch]*halving_factor[lr_arch]
+            # If an external lr schedule is not set, use newbob learning rate anealing
+            if ep<N_ep-1 and auto_lr_annealing[lr_arch]:
+                if ((err_valid_mean_prev-err_valid_mean)/err_valid_mean)<improvement_threshold[lr_arch]:
+                    lr[lr_arch][ep+1]=str(float(lr[lr_arch][ep])*halving_factor[lr_arch])
 
 # Training has ended, copy the last .pkl to final_arch.pkl for production
 for pt_arch in pt_files.keys():
@@ -256,7 +303,8 @@ for pt_arch in pt_files.keys():
 for forward_data in forward_data_lst:
            
          # Compute the number of chunks
-         N_ck_forward=compute_n_chunks(out_folder,forward_data,ep,'forward')
+         N_ck_forward=compute_n_chunks(out_folder,forward_data,ep,N_ep_str_format,'forward')
+         N_ck_str_format='0'+str(max(math.ceil(np.log10(N_ck_forward)),1))+'d'
          
          for ck in range(N_ck_forward):
             
@@ -264,27 +312,34 @@ for forward_data in forward_data_lst:
                 print('Testing %s chunk = %i / %i' %(forward_data,ck+1, N_ck_forward))
             else: 
                 print('Forwarding %s chunk = %i / %i' %(forward_data,ck+1, N_ck_forward))
-
-            # path of the list of features for this chunk
-            lst_file=out_folder+'/exp_files/forward_'+forward_data+'_ep'+format(ep, "03d")+'_ck'+format(ck, "02d")+'_*.lst'
             
             # output file
-            info_file=out_folder+'/exp_files/forward_'+forward_data+'_ep'+format(ep, "03d")+'_ck'+format(ck, "02d")+'.info'
-            config_chunk_file=out_folder+'/exp_files/forward_'+forward_data+'_ep'+format(ep, "03d")+'_ck'+format(ck, "02d")+'.cfg'
-       
-            # Write chunk-specific cfg file
-            write_cfg_chunk(cfg_file,config_chunk_file,cfg_file_proto_chunk,model_files,lst_file,info_file,'forward',forward_data,lr,max_seq_length_train_curr,name_data,ep,ck)
+            info_file=out_folder+'/exp_files/forward_'+forward_data+'_ep'+format(ep, N_ep_str_format)+'_ck'+format(ck, N_ck_str_format)+'.info'
+            config_chunk_file=out_folder+'/exp_files/forward_'+forward_data+'_ep'+format(ep, N_ep_str_format)+'_ck'+format(ck, N_ck_str_format)+'.cfg'
+
             
             # Do forward if the chunk was not already processed
             if not(os.path.exists(info_file)):
                                 
                 # Doing forward
-                cmd_chunk=cmd+'python ' + run_nn_script + ' ' + config_chunk_file + ' 2> ' + log_file
-                run_shell_display(cmd_chunk)
+                
+                # getting the next chunk 
+                next_config_file=cfg_file_list[op_counter]
+                                         
+                # run chunk processing                    
+                [data_name,data_set,data_end_index,fea_dict,lab_dict,arch_dict]=run_nn(data_name,data_set,data_end_index,fea_dict,lab_dict,arch_dict,config_chunk_file,processed_first,next_config_file)
+                
+                
+                # update the first_processed variable
+                processed_first=False
             
                 if not(os.path.exists(info_file)):
                     sys.stderr.write("ERROR: forward chunk %i of dataset %s not done! File %s does not exist.\nSee %s \n" % (ck,forward_data,info_file,log_file))
                     sys.exit(0)
+            
+            
+            # update the operation counter
+            op_counter+=1
                     
                
             
@@ -372,6 +427,9 @@ for data in forward_data_lst:
 # Saving Loss and Err as .txt and plotting curves
 if not is_production:
     create_curves(out_folder, N_ep, valid_data_lst)
+    
+    
+
             
             
 

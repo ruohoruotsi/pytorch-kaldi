@@ -4,7 +4,7 @@ cfg_proto_chunk=path
 
 [exp]
 cmd=str
-run_nn_script=path
+run_nn_script=str
 to_do={train,valid,forward}
 seed=int(-inf,inf)
 use_cuda=bool
@@ -20,7 +20,7 @@ lab=str
 
 
 [batches]
-batch_size_train=int(1,inf)
+batch_size_train=int(0,inf)
 max_seq_length_train=int(20,inf)
 batch_size_valid=int(1,inf)
 max_seq_length_valid=int(20,inf)

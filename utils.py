@@ -18,9 +18,7 @@ import importlib
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import matplotlib as mpl
-mpl.use('Agg')
-import matplotlib.pyplot as plt
+import math
 
 
 
@@ -144,7 +142,7 @@ def compute_avg_performance(info_lst):
         config_res.read(tr_info_file)
         losses.append(float(config_res['results']['loss']))
         errors.append(float(config_res['results']['err']))
-        times.append(float(config_res['results']['elapsed_time']))
+        times.append(float(config_res['results']['elapsed_time_chunk']))
         
     loss=np.mean(losses)
     error=np.mean(errors)
@@ -476,7 +474,28 @@ def check_cfg(cfg_file,config,cfg_file_proto):
     if not(set(data_use_with).issubset(name_data)):
         sys.stderr.write("ERROR: in [data_use] you are using a dataset not specified in [dataset*] %s \n" % (cfg_file))
         sec_parse=False
+     
+    # Set to false the first layer norm layer if the architecture is sequential (to avoid numerical instabilities)
+    seq_model=False
+    for sec in config.sections():
+     if "architecture" in sec:  
+         if strtobool(config[sec]['arch_seq_model']):
+             seq_model=True
+             break
+         
+    if seq_model:
+        for item in list(config['architecture1'].items()):
+            if 'use_laynorm' in item[0] and '_inp' not in item[0]:
+                ln_list=item[1].split(',')
+                if ln_list[0]=='True':
+                    ln_list[0]='False'
+                    config['architecture1'][item[0]]=','.join(ln_list)
+
+                    
         
+ 
+    
+     
     # Parse fea and lab  fields in datasets*
     cnt=0
     fea_names_lst=[]
@@ -534,7 +553,25 @@ def check_cfg(cfg_file,config,cfg_file_proto):
     lab_folders=list(re.findall('lab_folder=(.*)\n',config['dataset1']['lab'].replace(' ','')))
     N_out_lab=['none'] * len(lab_lst)
 
+    for i in range(len(lab_opts)):
         
+        # Compute number of monophones if needed
+        if "ali-to-phones" in lab_opts[i]:
+
+            log_file=config['exp']['out_folder']+'/log.log'
+            folder_lab_count=lab_folders[i]
+            cmd="hmm-info "+folder_lab_count+"/final.mdl | awk '/phones/{print $4}'"
+            output=run_shell(cmd,log_file)
+            if output.decode().rstrip()=='':
+                sys.stderr.write("ERROR: hmm-info command doesn't exist. Make sure your .bashrc contains the Kaldi paths and correctly exports it.\n")
+                sys.exit(0)
+    
+            N_out=int(output.decode().rstrip())
+            N_out_lab[i]=N_out
+
+
+        
+    
     for i in range(len(forward_out_lst)):
 
         if forward_out_lst[i] not in possible_outs:
@@ -556,7 +593,10 @@ def check_cfg(cfg_file,config,cfg_file_proto):
                         
                     
             else:
-                # Try to automatically retrieve the config file
+                # Try to automatically retrieve the count file from the config file
+    
+                    
+                # Compute the number of context-dependent phone states    
                 if "ali-to-pdf" in lab_opts[lab_lst.index(forward_norm_lst[i])]:
                     log_file=config['exp']['out_folder']+'/log.log'
                     folder_lab_count=lab_folders[lab_lst.index(forward_norm_lst[i])]
@@ -582,7 +622,6 @@ def check_cfg(cfg_file,config,cfg_file_proto):
 
     
     # When possible replace the pattern "N_out_lab*" with the detected number of output
-
     for sec in config.sections():
         for field in list(config[sec]):
             for i in range(len(lab_lst)):
@@ -591,6 +630,7 @@ def check_cfg(cfg_file,config,cfg_file_proto):
                 if pattern in config[sec][field]:
                     if N_out_lab[i]!='none':
                         config[sec][field]=config[sec][field].replace(pattern,str(N_out_lab[i]))
+
                     else:
                        sys.stderr.write('ERROR: Cannot automatically retrieve the number of output in %s. Please, add manually the number of outputs \n' %(pattern))
                        sys.exit(0)
@@ -631,13 +671,166 @@ def split_chunks(seq, size):
         for i in range(size):
                 newseq.append(seq[int(round(i*splitsize)):int(round((i+1)*splitsize))])
         return newseq
+
+def create_configs(config):
     
-def create_chunks(config):
+    # This function create the chunk-specific config files
+    cfg_file_proto_chunk=config['cfg_proto']['cfg_proto_chunk']
+    N_ep=int(config['exp']['N_epochs_tr'])
+    N_ep_str_format='0'+str(max(math.ceil(np.log10(N_ep)),1))+'d'
+    tr_data_lst=config['data_use']['train_with'].split(',')
+    valid_data_lst=config['data_use']['valid_with'].split(',')
+    max_seq_length_train=config['batches']['max_seq_length_train']
+    forward_data_lst=config['data_use']['forward_with'].split(',')
+
+    
+    out_folder=config['exp']['out_folder']
+    cfg_file=out_folder+'/conf.cfg'
+    chunk_lst=out_folder+'/exp_files/list_chunks.txt'
+    
+    lst_chunk_file = open(chunk_lst, 'w')
+    
+    # Read the batch size string
+    batch_size_tr_str=config['batches']['batch_size_train']
+    batch_size_tr_arr=expand_str_ep(batch_size_tr_str,'int',N_ep,'|','*')
+    
+    # Read the max_seq_length_train
+    max_seq_length_tr_arr=expand_str_ep(max_seq_length_train,'int',N_ep,'|','*')
+
+
+    cfg_file_proto=config['cfg_proto']['cfg_proto']
+    [config,name_data,name_arch]=check_cfg(cfg_file,config,cfg_file_proto)
+    
+
+    arch_lst=get_all_archs(config)
+    lr={}
+    improvement_threshold={}
+    halving_factor={}
+    pt_files={}
+    drop_rates={}
+    for arch in arch_lst:
+        lr_arr=expand_str_ep(config[arch]['arch_lr'],'float',N_ep,'|','*')
+        lr[arch]=lr_arr
+
+        improvement_threshold[arch]=float(config[arch]['arch_improvement_threshold'])
+        halving_factor[arch]=float(config[arch]['arch_halving_factor'])
+        pt_files[arch]=config[arch]['arch_pretrain_file']
+        
+        # Loop over all the sections and look for a "_drop" field (to perform dropout scheduling
+        for (field_key, field_val) in config.items(arch):
+            if "_drop" in field_key:
+                drop_lay=field_val.split(',')
+                N_lay=len(drop_lay)
+                drop_rates[arch]=[]
+                for lay_id in range(N_lay):
+                    drop_rates[arch].append(expand_str_ep(drop_lay[lay_id],'float',N_ep,'|','*'))
+                 
+                # Check dropout factors
+                for dropout_factor in drop_rates[arch][0]:
+                    if float(dropout_factor)<0.0 or float(dropout_factor)>1.0:
+                        sys.stderr.write('The dropout rate should be between 0 and 1. Got %s in %s.\n' %(dropout_factor,field_key))
+                        sys.exit(0)
+       
+        
+    
+    if strtobool(config['batches']['increase_seq_length_train']):
+        max_seq_length_train_curr=int(config['batches']['start_seq_len_train'])
+
+        
+    for ep in range(N_ep):
+        
+    
+        for tr_data in tr_data_lst:
+            
+            # Compute the total number of chunks for each training epoch
+            N_ck_tr=compute_n_chunks(out_folder,tr_data,ep,N_ep_str_format,'train')
+            N_ck_str_format='0'+str(max(math.ceil(np.log10(N_ck_tr)),1))+'d'
+         
+            # ***Epoch training***
+            for ck in range(N_ck_tr):
+                
+                # path of the list of features for this chunk
+                lst_file=out_folder+'/exp_files/train_'+tr_data+'_ep'+format(ep, N_ep_str_format)+'_ck'+format(ck, N_ck_str_format)+'_*.lst'
+                
+                # paths of the output files (info,model,chunk_specific cfg file)
+                info_file=out_folder+'/exp_files/train_'+tr_data+'_ep'+format(ep,  N_ep_str_format)+'_ck'+format(ck, N_ck_str_format)+'.info'
+                
+                if ep+ck==0:
+                    model_files_past={}
+                else:
+                    model_files_past=model_files
+                    
+                model_files={}
+                for arch in pt_files.keys():
+                    model_files[arch]=info_file.replace('.info','_'+arch+'.pkl')
+                
+                config_chunk_file=out_folder+'/exp_files/train_'+tr_data+'_ep'+format(ep, N_ep_str_format)+'_ck'+format(ck, N_ck_str_format)+'.cfg'
+                lst_chunk_file.write(config_chunk_file+'\n')
+                
+                if strtobool(config['batches']['increase_seq_length_train'])==False:
+                    max_seq_length_train_curr=int(max_seq_length_tr_arr[ep])
+                    
+                # Write chunk-specific cfg file
+                write_cfg_chunk(cfg_file,config_chunk_file,cfg_file_proto_chunk,pt_files,lst_file,info_file,'train',tr_data,lr,max_seq_length_train_curr,name_data,ep,ck,batch_size_tr_arr[ep],drop_rates)
+                
+                # update pt_file (used to initialized the DNN for the next chunk)  
+                for pt_arch in pt_files.keys():
+                    pt_files[pt_arch]=out_folder+'/exp_files/train_'+tr_data+'_ep'+format(ep, N_ep_str_format)+'_ck'+format(ck, N_ck_str_format)+'_'+pt_arch+'.pkl'
+        
+        for valid_data in valid_data_lst:
+            
+            # Compute the number of chunks for each validation dataset
+            N_ck_valid=compute_n_chunks(out_folder,valid_data,ep,N_ep_str_format,'valid')
+            N_ck_str_format='0'+str(max(math.ceil(np.log10(N_ck_valid)),1))+'d'
+        
+            for ck in range(N_ck_valid):
+                
+                # path of the list of features for this chunk
+                lst_file=out_folder+'/exp_files/valid_'+valid_data+'_ep'+format(ep, N_ep_str_format)+'_ck'+format(ck, N_ck_str_format)+'_*.lst'
+                
+                # paths of the output files
+                info_file=out_folder+'/exp_files/valid_'+valid_data+'_ep'+format(ep, N_ep_str_format)+'_ck'+format(ck, N_ck_str_format)+'.info'            
+                config_chunk_file=out_folder+'/exp_files/valid_'+valid_data+'_ep'+format(ep, N_ep_str_format)+'_ck'+format(ck, N_ck_str_format)+'.cfg'
+                lst_chunk_file.write(config_chunk_file+'\n')
+                # Write chunk-specific cfg file
+                write_cfg_chunk(cfg_file,config_chunk_file,cfg_file_proto_chunk,model_files,lst_file,info_file,'valid',valid_data,lr,max_seq_length_train_curr,name_data,ep,ck,batch_size_tr_arr[ep],drop_rates)
+    
+        #  if needed, update sentence_length
+        if strtobool(config['batches']['increase_seq_length_train']):
+            max_seq_length_train_curr=max_seq_length_train_curr*int(config['batches']['multply_factor_seq_len_train'])
+            if max_seq_length_train_curr>int(max_seq_length_tr_arr[ep]):
+                max_seq_length_train_curr=int(max_seq_length_tr_arr[ep])
+            
+        
+    for forward_data in forward_data_lst:
+               
+             # Compute the number of chunks
+             N_ck_forward=compute_n_chunks(out_folder,forward_data,ep,N_ep_str_format,'forward')
+             N_ck_str_format='0'+str(max(math.ceil(np.log10(N_ck_forward)),1))+'d'
+             
+             for ck in range(N_ck_forward):
+                        
+                # path of the list of features for this chunk
+                lst_file=out_folder+'/exp_files/forward_'+forward_data+'_ep'+format(ep, N_ep_str_format)+'_ck'+format(ck, N_ck_str_format)+'_*.lst'
+                
+                # output file
+                info_file=out_folder+'/exp_files/forward_'+forward_data+'_ep'+format(ep, N_ep_str_format)+'_ck'+format(ck, N_ck_str_format)+'.info'
+                config_chunk_file=out_folder+'/exp_files/forward_'+forward_data+'_ep'+format(ep, N_ep_str_format)+'_ck'+format(ck, N_ck_str_format)+'.cfg'
+                lst_chunk_file.write(config_chunk_file+'\n')
+                
+                # Write chunk-specific cfg file
+                write_cfg_chunk(cfg_file,config_chunk_file,cfg_file_proto_chunk,model_files,lst_file,info_file,'forward',forward_data,lr,max_seq_length_train_curr,name_data,ep,ck,batch_size_tr_arr[ep],drop_rates)
+                    
+    lst_chunk_file.close()
+                    
+                    
+def create_lists(config):
     
     # splitting data into chunks (see out_folder/additional_files)
     out_folder=config['exp']['out_folder']
     seed=int(config['exp']['seed'])
     N_ep=int(config['exp']['N_epochs_tr'])    
+    N_ep_str_format='0'+str(max(math.ceil(np.log10(N_ep)),1))+'d'
     
     # Setting the random seed
     random.seed(seed)
@@ -651,7 +844,8 @@ def create_chunks(config):
         [fea_names,list_fea,fea_opts,cws_left,cws_right]=parse_fea_field(config[cfg_item2sec(config,'data_name',dataset)]['fea'])
 
         N_chunks= int(config[sec_data]['N_chunks'])
-        
+        N_ck_str_format='0'+str(max(math.ceil(np.log10(N_chunks)),1))+'d'
+         
         full_list=[]
         
         for i in range(len(fea_names)):
@@ -679,7 +873,7 @@ def create_chunks(config):
                         #print(snt.split(',')[i])
                         tr_chunks_fea_split.append(snt.split(',')[i])
                         
-                    output_lst_file=out_folder+'/exp_files/train_'+dataset+'_ep'+format(ep, "03d")+'_ck'+format(ck, "02d")+'_'+fea_names[i]+'.lst'
+                    output_lst_file=out_folder+'/exp_files/train_'+dataset+'_ep'+format(ep,  N_ep_str_format)+'_ck'+format(ck, N_ck_str_format)+'_'+fea_names[i]+'.lst'
                     f=open(output_lst_file,'w')
                     tr_chunks_fea_wr=map(lambda x:x+'\n', tr_chunks_fea_split)
                     f.writelines(tr_chunks_fea_wr)
@@ -695,6 +889,7 @@ def create_chunks(config):
         [fea_names,list_fea,fea_opts,cws_left,cws_right]=parse_fea_field(config[cfg_item2sec(config,'data_name',dataset)]['fea'])
 
         N_chunks= int(config[sec_data]['N_chunks'])
+        N_ck_str_format='0'+str(max(math.ceil(np.log10(N_chunks)),1))+'d'
         
         full_list=[]
         
@@ -722,7 +917,7 @@ def create_chunks(config):
                         #print(snt.split(',')[i])
                         valid_chunks_fea_split.append(snt.split(',')[i])
                         
-                    output_lst_file=out_folder+'/exp_files/valid_'+dataset+'_ep'+format(ep, "03d")+'_ck'+format(ck, "02d")+'_'+fea_names[i]+'.lst'
+                    output_lst_file=out_folder+'/exp_files/valid_'+dataset+'_ep'+format(ep, N_ep_str_format)+'_ck'+format(ck, N_ck_str_format)+'_'+fea_names[i]+'.lst'
                     f=open(output_lst_file,'w')
                     valid_chunks_fea_wr=map(lambda x:x+'\n', valid_chunks_fea_split)
                     f.writelines(valid_chunks_fea_wr)
@@ -738,6 +933,7 @@ def create_chunks(config):
         [fea_names,list_fea,fea_opts,cws_left,cws_right]=parse_fea_field(config[cfg_item2sec(config,'data_name',dataset)]['fea'])
 
         N_chunks= int(config[sec_data]['N_chunks'])
+        N_ck_str_format='0'+str(max(math.ceil(np.log10(N_chunks)),1))+'d'
         
         full_list=[]
         
@@ -765,7 +961,7 @@ def create_chunks(config):
                     #print(snt.split(',')[i])
                     forward_chunks_fea_split.append(snt.split(',')[i])
                     
-                output_lst_file=out_folder+'/exp_files/forward_'+dataset+'_ep'+format(ep, "03d")+'_ck'+format(ck, "02d")+'_'+fea_names[i]+'.lst'
+                output_lst_file=out_folder+'/exp_files/forward_'+dataset+'_ep'+format(ep, N_ep_str_format)+'_ck'+format(ck,N_ck_str_format)+'_'+fea_names[i]+'.lst'
                 f=open(output_lst_file,'w')
                 forward_chunks_fea_wr=map(lambda x:x+'\n', forward_chunks_fea_split)
                 f.writelines(forward_chunks_fea_wr)
@@ -773,7 +969,7 @@ def create_chunks(config):
 
     
     
-def write_cfg_chunk(cfg_file,config_chunk_file,cfg_file_proto_chunk,pt_files,lst_file,info_file,to_do,data_set_name,lr,max_seq_length_train_curr,name_data,ep,ck):
+def write_cfg_chunk(cfg_file,config_chunk_file,cfg_file_proto_chunk,pt_files,lst_file,info_file,to_do,data_set_name,lr,max_seq_length_train_curr,name_data,ep,ck,batch_size,drop_rates):
                     
     # writing the chunk-specific cfg file
     config = configparser.ConfigParser()
@@ -789,13 +985,25 @@ def write_cfg_chunk(cfg_file,config_chunk_file,cfg_file_proto_chunk,pt_files,lst
     # change seed for randomness
     config_chunk['exp']['seed']=str(int(config_chunk['exp']['seed'])+ep+ck)
     
+    config_chunk['batches']['batch_size_train']=batch_size
+    
     for arch in pt_files.keys():
         config_chunk[arch]['arch_pretrain_file']=pt_files[arch]
     
     # writing the current learning rate
     for lr_arch in lr.keys():
-        config_chunk[lr_arch ]['arch_lr']=str(lr[lr_arch])
-    
+        config_chunk[lr_arch]['arch_lr']=str(lr[lr_arch][ep])
+        
+        for (field_key, field_val) in config.items(lr_arch):
+            if "_drop" in field_key:
+                N_lay=len(drop_rates[lr_arch])
+                drop_arr=[]
+                for lay in range(N_lay):
+                    drop_arr.append(drop_rates[lr_arch][lay][ep])
+                
+                config_chunk[lr_arch][field_key]=str(','.join(drop_arr))
+
+       
     # Data_chunk section
     config_chunk.add_section('data_chunk')
 
@@ -836,10 +1044,10 @@ def write_cfg_chunk(cfg_file,config_chunk_file,cfg_file_proto_chunk,pt_files,lst
     # Write cfg_file_chunk
     with open(config_chunk_file, 'w') as configfile:
         config_chunk.write(configfile)
-                    
+                   
     # Check cfg_file_chunk
     [config_proto_chunk,name_data_ck,name_arch_ck]=check_consistency_with_proto(config_chunk_file,cfg_file_proto_chunk)
-    
+
     
 def parse_fea_field(fea):
     
@@ -940,8 +1148,8 @@ def parse_lab_field(lab):
     return [lab_names,lab_folders,lab_opts]
 
 
-def compute_n_chunks(out_folder,data_list,ep,step):
-    list_ck=sorted(glob.glob(out_folder+'/exp_files/'+step+'_'+data_list+'_ep'+format(ep, "03d")+'*.lst'))
+def compute_n_chunks(out_folder,data_list,ep,N_ep_str_format,step):
+    list_ck=sorted(glob.glob(out_folder+'/exp_files/'+step+'_'+data_list+'_ep'+format(ep, N_ep_str_format)+'*.lst'))
     last_ck=list_ck[-1]
     N_ck=int(re.findall('_ck(.+)_', last_ck)[-1].split('_')[0])+1
     return N_ck
@@ -1706,10 +1914,11 @@ def dump_epoch_results(res_file_path, ep, tr_data_lst, tr_loss_tot, tr_error_tot
     # Default terminal line size is 80 characters, try new dispositions to fit this limit
     #
 
+    N_ep_str_format='0'+str(max(math.ceil(np.log10(N_ep)),1))+'d'
     res_file = open(res_file_path, "a")
-    res_file.write('ep=%s tr=%s loss=%s err=%s ' %(format(ep, "03d"),tr_data_lst,format(tr_loss_tot/len(tr_data_lst), "0.3f"),format(tr_error_tot/len(tr_data_lst), "0.3f")))
+    res_file.write('ep=%s tr=%s loss=%s err=%s ' %(format(ep, N_ep_str_format),tr_data_lst,format(tr_loss_tot/len(tr_data_lst), "0.3f"),format(tr_error_tot/len(tr_data_lst), "0.3f")))
     print(' ')
-    print('----- Summary epoch %s / %s'%(format(ep, "03d"),format(N_ep-1, "03d")))
+    print('----- Summary epoch %s / %s'%(format(ep, N_ep_str_format),format(N_ep-1, N_ep_str_format)))
     print('Training on %s' %(tr_data_lst))
     print('Loss = %s | err = %s '%(format(tr_loss_tot/len(tr_data_lst), "0.3f"),format(tr_error_tot/len(tr_data_lst), "0.3f")))
     print('-----')
@@ -1720,8 +1929,8 @@ def dump_epoch_results(res_file_path, ep, tr_data_lst, tr_loss_tot, tr_error_tot
 
     print('-----')
     for lr_arch in lr.keys():
-        res_file.write('lr_%s=%f ' %(lr_arch,lr[lr_arch]))
-        print('Learning rate on %s = %f ' %(lr_arch,lr[lr_arch]))
+        res_file.write('lr_%s=%s ' %(lr_arch,lr[lr_arch][ep]))
+        print('Learning rate on %s = %s ' %(lr_arch,lr[lr_arch][ep]))
     print('-----')
     res_file.write('time(s)=%i\n' %(int(tot_time)))
     print('Elapsed time (s) = %i\n' %(int(tot_time)))
@@ -1740,6 +1949,7 @@ def progress(count, total, status=''):
     sys.stdout.write("\n")
   else:
     sys.stdout.write('[%s] %s%s %s\r' % (bar, percents, '%', status))
+    
   sys.stdout.flush()  
 
 
@@ -1783,6 +1993,15 @@ def export_loss_acc_to_txt(out_folder, N_ep, val_lst):
 
 def create_curves(out_folder, N_ep, val_lst):
 
+    try:
+        import matplotlib as mpl
+        mpl.use('Agg')
+        import matplotlib.pyplot as plt
+
+    except ValueError:
+        print('WARNING:  matplotlib is not installed. The plots of the training curves have not been created.')
+        sys.exit(0)
+      
     print(' ')
     print('-----')
     print('Generating output files and plots ... ')
@@ -1869,4 +2088,72 @@ def nth_replace_string(s, sub, repl, nth):
     if i == nth:
         return s[:find]+repl+s[find + len(sub):]
     return s
+
+
+def change_lr_cfg(cfg_file,lr,ep):
+    
+    config = configparser.ConfigParser()
+    config.read(cfg_file)
+    field='arch_lr'
+    
+    for lr_arch in lr.keys():
+
+        config.set(lr_arch,field,str(lr[lr_arch][ep]))
+            
+    # Write cfg_file_chunk
+    with open(cfg_file, 'w') as configfile:
+        config.write(configfile)
+    
+def shift(arr, num, fill_value=np.nan):
+    if num >= 0:
+        return np.concatenate((np.full(num, fill_value), arr[:-num]))
+    else:
+        return np.concatenate((arr[-num:], np.full(-num, fill_value)))
+
+  
+def expand_str_ep(str_compact,type_inp,N_ep,split_elem,mult_elem):
+    
+    lst_out=[]
+    
+    str_compact_lst=str_compact.split(split_elem)
+    
+    for elem in str_compact_lst:
+        elements=elem.split(mult_elem)
+        
+        if type_inp=='int':
+            try: 
+                int(elements[0])
+            except ValueError:
+              sys.stderr.write('The string "%s" must contain integers. Got %s.\n' %(str_compact,elements[0])) 
+              sys.exit(0)
+              
+        if type_inp=='float':
+            try: 
+                float(elements[0])
+            except ValueError:
+              sys.stderr.write('The string "%s" must contain floats. Got %s.\n' %(str_compact,elements[0])) 
+              sys.exit(0)
+        
+        if len(elements)==2:
+            try: 
+                int(elements[1])
+                lst_out.extend([elements[0] for i in range(int(elements[1]))])
+            except ValueError:
+              sys.stderr.write('The string "%s" must contain integers. Got %s\n' %(str_compact,elements[1])) 
+              sys.exit(0)
+        
+        if len(elements)==1:
+            lst_out.append(elements[0])
+    
+    if len(str_compact_lst)==1 and len(elements)==1:
+        lst_out.extend([elements[0] for i in range(N_ep-1)])
+        
+      
+    # Final check
+    if len(lst_out)!=N_ep:
+       sys.stderr.write('The total number of elements specified in the string "%s" is equal to %i not equal to the total number of epochs %s.\n' %(str_compact,len(lst_out),N_ep)) 
+       sys.exit(0)
+      
+    return lst_out
+    
     
