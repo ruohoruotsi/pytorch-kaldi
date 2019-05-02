@@ -13,6 +13,10 @@ import numpy as np
 from distutils.util import strtobool
 import math
 
+# uncomment below if you want to use SRU
+# and you need to install SRU: pip install sru[cuda].
+# or you can install it from source code: https://github.com/taolei87/sru.
+# import sru
 
 class LayerNorm(nn.Module):
 
@@ -155,10 +159,10 @@ class LSTM_cudnn(nn.Module):
         self.input_dim=inp_dim
         self.hidden_size=int(options['hidden_size'])
         self.num_layers=int(options['num_layers'])
-        self.bias=strtobool(options['bias'])
-        self.batch_first=strtobool(options['batch_first'])
+        self.bias=bool(strtobool(options['bias']))
+        self.batch_first=bool(strtobool(options['batch_first']))
         self.dropout=float(options['dropout'])
-        self.bidirectional=strtobool(options['bidirectional'])
+        self.bidirectional=bool(strtobool(options['bidirectional']))
         
         self.lstm = nn.ModuleList([nn.LSTM(self.input_dim, self.hidden_size, self.num_layers, 
                             bias=self.bias,dropout=self.dropout,bidirectional=self.bidirectional)])
@@ -179,7 +183,6 @@ class LSTM_cudnn(nn.Module):
             h0=h0.cuda()
             c0=c0.cuda()
             
-            
         output, (hn, cn) = self.lstm[0](x, (h0, c0))
         
         
@@ -194,10 +197,10 @@ class GRU_cudnn(nn.Module):
         self.input_dim=inp_dim
         self.hidden_size=int(options['hidden_size'])
         self.num_layers=int(options['num_layers'])
-        self.bias=strtobool(options['bias'])
-        self.batch_first=strtobool(options['batch_first'])
+        self.bias=bool(strtobool(options['bias']))
+        self.batch_first=bool(strtobool(options['batch_first']))
         self.dropout=float(options['dropout'])
-        self.bidirectional=strtobool(options['bidirectional'])
+        self.bidirectional=bool(strtobool(options['bidirectional']))
         
         self.gru = nn.ModuleList([nn.GRU(self.input_dim, self.hidden_size, self.num_layers, 
                             bias=self.bias,dropout=self.dropout,bidirectional=self.bidirectional)])
@@ -230,10 +233,10 @@ class RNN_cudnn(nn.Module):
         self.hidden_size=int(options['hidden_size'])
         self.num_layers=int(options['num_layers'])
         self.nonlinearity=options['nonlinearity']
-        self.bias=strtobool(options['bias'])
-        self.batch_first=strtobool(options['batch_first'])
+        self.bias=bool(strtobool(options['bias']))
+        self.batch_first=bool(strtobool(options['batch_first']))
         self.dropout=float(options['dropout'])
-        self.bidirectional=strtobool(options['bidirectional'])
+        self.bidirectional=bool(strtobool(options['bidirectional']))
         
         self.rnn = nn.ModuleList([nn.RNN(self.input_dim, self.hidden_size, self.num_layers, 
                             nonlinearity=self.nonlinearity,bias=self.bias,dropout=self.dropout,bidirectional=self.bidirectional)])
@@ -1658,6 +1661,49 @@ def flip(x, dim):
     x = x.view(x.size(0), x.size(1), -1)[:, getattr(torch.arange(x.size(1)-1, -1, -1), ('cpu','cuda')[x.is_cuda])().long(), :]
     return x.view(xsize)
 
+class SRU(nn.Module):
+    def __init__(self, options, inp_dim):
+        super(SRU, self).__init__()
+        self.input_dim = inp_dim
+        self.hidden_size = int(options['sru_hidden_size'])
+        self.num_layers = int(options['sru_num_layers'])
+        self.dropout = float(options['sru_dropout'])
+        self.rnn_dropout = float(options['sru_rnn_dropout'])
+        self.use_tanh = bool(strtobool(options['sru_use_tanh']))
+        self.use_relu = bool(strtobool(options['sru_use_relu']))
+        self.use_selu = bool(strtobool(options['sru_use_selu']))
+        self.weight_norm = bool(strtobool(options['sru_weight_norm']))
+        self.layer_norm = bool(strtobool(options['sru_layer_norm']))
+        self.bidirectional = bool(strtobool(options['sru_bidirectional']))
+        self.is_input_normalized = bool(strtobool(options['sru_is_input_normalized']))
+        self.has_skip_term = bool(strtobool(options['sru_has_skip_term']))
+        self.rescale = bool(strtobool(options['sru_rescale']))
+        self.highway_bias = float(options['sru_highway_bias'])
+        self.n_proj = int(options['sru_n_proj'])
+        self.sru = sru.SRU(self.input_dim, self.hidden_size,
+                            num_layers=self.num_layers,
+                            dropout=self.dropout,
+                            rnn_dropout=self.rnn_dropout,
+                            bidirectional=self.bidirectional,
+                            n_proj=self.n_proj,
+                            use_tanh=self.use_tanh,
+                            use_selu=self.use_selu,
+                            use_relu=self.use_relu,
+                            weight_norm=self.weight_norm,
+                            layer_norm=self.layer_norm,
+                            has_skip_term=self.has_skip_term,
+                            is_input_normalized=self.is_input_normalized,
+                            highway_bias=self.highway_bias,
+                            rescale=self.rescale)
+        self.out_dim = self.hidden_size+self.bidirectional*self.hidden_size
 
-
+    def forward(self, x):
+        if self.bidirectional:
+            h0 = torch.zeros(self.num_layers, x.shape[1], self.hidden_size*2)
+        else:
+            h0 = torch.zeros(self.num_layers, x.shape[1], self.hidden_size)
+        if x.is_cuda:
+            h0 = h0.cuda()
+        output, hn = self.sru(x, c0=h0)
+        return output
 
