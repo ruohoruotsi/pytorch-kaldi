@@ -23,6 +23,22 @@ To improve transparency and replicability of speech recognition results, we give
 
 [See a short introductory video on the PyTorch-Kaldi Toolkit](https://www.youtube.com/watch?v=VDQaf0SS4K0&t=2s)
 
+## Next Version: SpeechBrain 
+We are happy to announce the SpeechBrain project (https://speechbrain.github.io/), that aims to develop an **open-source all-in-one** toolkit based on PyTorch. The SpeechBrain project will significantly extend the functionality of the current PyTorch-Kaldi toolkit. 
+
+The goal is to develop a *single*, *flexible*, and *user-friendly* toolkit that can be used to easily develop state-of-the-art speech systems for speech recognition (both end-to-end and HMM-DNN), speaker recognition, speech separation, multi-microphone signal processing (e.g, beamforming), self-supervised learning, and many others.
+
+The project will be lead by Mila and is sponsored by Samsung, Nvidia, Dolby. 
+SpeechBrain will also benefit from the collaboration and expertise of other companies such as Facebook/PyTorch, IBMResearch, FluentAI. 
+
+We are actively looking for collaborators. Feel free to contact us at speechbrainproject@gmail.com if you are interested to collaborate.
+
+Thanks to our sponsors we are also able to hire interns working at Mila on the SpeechBrain project. The ideal candidate is a PhD student with experience on pytorch and speech technologies (send your CV to speechbrainproject@gmail.com)
+
+The development of SpeechBrain will require some months before having a working repository. Meanwhile, we will continue providing support for the pytorch-kaldi project.
+
+Stay Tuned!
+
 
 ## Table of Contents
 * [Introduction](#introduction)
@@ -252,27 +268,29 @@ You can directly compare your results with ours by going [here](https://bitbucke
 The steps to run PyTorch-Kaldi on the Librispeech dataset are similar to that reported above for TIMIT. The following tutorial is based on the *100h sub-set*, but it can be easily extended to the full dataset (960h).
 
 1. Run the Kaldi recipe for librispeech at least until Stage 13 (included)
-
-2. Compute the fmllr features by running the following script. But first copy exp/tri4b/trans.* files into exp/tri4b/decode_tgsmall_train_clean_100/ before running the below script with chunk=train_clean_100
+2. Copy exp/tri4b/trans.* files into exp/tri4b/decode_tgsmall_train_clean_100/
+```
+mkdir exp/tri4b/decode_tgsmall_train_clean_100 && cp exp/tri4b/trans.* exp/tri4b/decode_tgsmall_train_clean_100/
+```
+3. Compute the fmllr features by running the following script. 
 
 ```
 . ./cmd.sh ## You'll want to change cmd.sh to something that will work on your system.
 . ./path.sh ## Source the tools/utils (import the queue.pl)
 
-chunk=train_clean_100
-#chunk=dev_clean # Uncomment to process dev
-#chunk=test_clean # Uncomment to process test
 gmmdir=exp/tri4b
 
-dir=fmllr/$chunk
-steps/nnet/make_fmllr_feats.sh --nj 10 --cmd "$train_cmd" \
-    --transform-dir $gmmdir/decode_tgsmall_$chunk \
-        $dir data/$chunk $gmmdir $dir/log $dir/data || exit 1
-        
-compute-cmvn-stats --spk2utt=ark:data/$chunk/spk2utt scp:fmllr/$chunk/feats.scp ark:$dir/data/cmvn_speaker.ark
+for chunk in train_clean_100 dev_clean test_clean; do
+    dir=fmllr/$chunk
+    steps/nnet/make_fmllr_feats.sh --nj 10 --cmd "$train_cmd" \
+        --transform-dir $gmmdir/decode_tgsmall_$chunk \
+            $dir data/$chunk $gmmdir $dir/log $dir/data || exit 1
+
+    compute-cmvn-stats --spk2utt=ark:data/$chunk/spk2utt scp:fmllr/$chunk/feats.scp ark:$dir/data/cmvn_speaker.ark
+done
 ```
 
-3. compute aligmenents using:
+4. compute aligmenents using:
 ```
 # aligments on dev_clean and test_clean
 steps/align_fmllr.sh --nj 30 data/train_clean_100 data/lang exp/tri4b exp/tri4b_ali_clean_100
@@ -280,9 +298,9 @@ steps/align_fmllr.sh --nj 10 data/dev_clean data/lang exp/tri4b exp/tri4b_ali_de
 steps/align_fmllr.sh --nj 10 data/test_clean data/lang exp/tri4b exp/tri4b_ali_test_clean_100
 ```
 
-4. run the experiments with the following command:
+5. run the experiments with the following command:
 ```
-  python run_exp.py cfg/Librispeech_baselines/libri_MLP_fmllr.cfg.
+  python run_exp.py cfg/Librispeech_baselines/libri_MLP_fmllr.cfg
 ```
 
 If you would like to use a recurrent model you can use *libri_RNN_fmllr.cfg*, *libri_LSTM_fmllr.cfg*, *libri_GRU_fmllr.cfg*, or *libri_liGRU_fmllr.cfg*. The training of recurrent models might take some days (depending on the adopted GPU).  The performance obtained with the tgsmall graph are reported in the following table:
